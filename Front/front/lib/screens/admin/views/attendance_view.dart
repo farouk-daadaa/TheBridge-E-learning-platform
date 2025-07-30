@@ -273,10 +273,12 @@ class _AttendanceViewState extends State<AttendanceView> with SingleTickerProvid
             Text(
               'Attendance',
               style: TextStyle(
+                color: Colors.white, 
                 fontWeight: FontWeight.bold,
                 fontSize: 20,
               ),
             ),
+
             SizedBox(height: 4),
             Text(
               widget.eventTitle,

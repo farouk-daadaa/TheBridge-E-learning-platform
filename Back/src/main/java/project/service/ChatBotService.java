@@ -19,16 +19,19 @@ public class ChatBotService {
 
     private static final Logger logger = LoggerFactory.getLogger(ChatBotService.class);
 
-    @Value("${huggingface.api.url}")
-    private String API_URL;
-
-    @Value("${huggingface.api.key}")
+    @Value("${openrouter.api.key}")
     private String API_KEY;
 
     @Value("${chatbot.cache.timeout}")
     private long cacheTimeoutSeconds;
 
-    // In-memory cache: question -> {answer, timestamp}
+    // OpenRouter chat completions endpoint (fixed)
+    private static final String API_URL = "https://openrouter.ai/api/v1/chat/completions";
+
+    // Change this to the OpenRouter model you want to use
+    private static final String MODEL_NAME = "deepseek/deepseek-r1-0528-qwen3-8b:free";
+
+    // Cache: question -> {answer, timestamp}
     private final Map<String, CacheEntry> answerCache = new ConcurrentHashMap<>();
 
     private static class CacheEntry {
@@ -43,14 +46,13 @@ public class ChatBotService {
 
     public String ask(String question) {
         try {
-            // Normalize question for cache key (trim, lowercase)
             String cacheKey = question.trim().toLowerCase();
 
-            // Check cache
+            // Check cache first
             CacheEntry cached = answerCache.get(cacheKey);
             if (cached != null) {
-                long currentTime = System.currentTimeMillis() / 1000;
-                if (currentTime - cached.timestamp < cacheTimeoutSeconds) {
+                long now = System.currentTimeMillis() / 1000;
+                if (now - cached.timestamp < cacheTimeoutSeconds) {
                     logger.debug("Returning cached answer for question: {}", question);
                     return cached.answer;
                 } else {
@@ -59,6 +61,7 @@ public class ChatBotService {
                 }
             }
 
+            // Build prompt (your existing prompt)
             String prompt = """
 You are 9antraBot, a helpful AI tutor on the 9antra e-learning platform. Your role is to assist students by answering their questions about the platform or their learning in a clear, accurate, and beginner-friendly way.
 
@@ -81,13 +84,31 @@ Question: """ + question + """
 Answer:
 """;
 
+            // Build JSON body for OpenRouter request
             JSONObject body = new JSONObject();
-            body.put("inputs", prompt);
-            // Add parameters for Mixtral
+            body.put("model", MODEL_NAME);
+
+            JSONArray messages = new JSONArray();
+
+            // System message (the prompt sets context)
+            JSONObject systemMessage = new JSONObject();
+            systemMessage.put("role", "system");
+            systemMessage.put("content", prompt);
+            messages.put(systemMessage);
+
+            // User message (the question itself)
+            JSONObject userMessage = new JSONObject();
+            userMessage.put("role", "user");
+            userMessage.put("content", question);
+            messages.put(userMessage);
+
+            body.put("messages", messages);
+
+            // Optional: temperature, max tokens, top_p etc.
             JSONObject parameters = new JSONObject();
-            parameters.put("max_new_tokens", 600); // For complete answers
-            parameters.put("temperature", 0.7); // Balanced creativity
-            parameters.put("top_p", 0.9); // Focused answers
+            parameters.put("temperature", 0.7);
+            parameters.put("max_tokens", 600);
+            parameters.put("top_p", 0.9);
             body.put("parameters", parameters);
 
             HttpRequest request = HttpRequest.newBuilder()
@@ -97,74 +118,60 @@ Answer:
                     .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
                     .build();
 
-            // Retry up to 3 times
+            // Retry logic
             for (int attempt = 1; attempt <= 3; attempt++) {
                 try {
-                    logger.debug("Sending request to Hugging Face API, attempt {}", attempt);
+                    logger.debug("Sending request to OpenRouter API, attempt {}", attempt);
                     HttpResponse<String> response = HttpClient.newHttpClient()
                             .send(request, HttpResponse.BodyHandlers.ofString());
+
                     String responseBody = response.body();
                     logger.debug("Received response: {}", responseBody);
 
-                    // Handle JSONArray response
-                    if (responseBody.trim().startsWith("[")) {
-                        JSONArray arr = new JSONArray(responseBody);
-                        if (!arr.isEmpty()) {
-                            String generatedText = arr.getJSONObject(0).getString("generated_text");
-                            // Extract answer
-                            String answer = generatedText.replace(prompt, "").trim();
-                            // Strip extra content
-                            if (answer.contains("Question:") || answer.contains("Learn 9antra") || answer.contains("Enroll in")) {
-                                answer = answer.split("Question:|Learn 9antra|Enroll in")[0].trim();
-                            }
-                            // Normalize whitespace
-                            answer = answer.replaceAll("\\s+", " ");
-
-                            // Cache the answer
-                            answerCache.put(cacheKey, new CacheEntry(answer, System.currentTimeMillis() / 1000));
-                            logger.debug("Cached answer for question: {}", question);
-
-                            return answer;
-                        } else {
-                            logger.warn("Empty response array from API");
-                            return "The model didn't return a response.";
+                    if (response.statusCode() != 200) {
+                        logger.error("Non-200 response: {} - {}", response.statusCode(), responseBody);
+                        if (attempt == 3) {
+                            return "API error (status " + response.statusCode() + "): " + responseBody;
                         }
+                        Thread.sleep(2000L * attempt);
+                        continue;
                     }
 
-                    // Handle error response
-                    JSONObject obj = new JSONObject(responseBody);
-                    if (obj.has("error")) {
-                        String error = obj.getString("error");
-                        logger.error("API error: {}", error);
-                        if (error.contains("Model is overloaded") && attempt < 3) {
-                            logger.info("Model overloaded, retrying after {} ms...", 2000 * attempt);
-                            Thread.sleep(2000L * attempt); // Exponential backoff
-                            continue;
-                        }
-                        if (error.contains("exceeded your monthly included credits")) {
-                            return "Sorry, the chatbot’s API credits are used up for this month. Please try again later.";
-                        }
-                        if (error.contains("Rate limit")) {
-                            return "Sorry, the chatbot is busy right now. Please try again in a few minutes.";
-                        }
-                        return "Error from Hugging Face API: " + error;
-                    } else if (obj.has("message")) {
-                        logger.warn("API message: {}", obj.getString("message"));
-                        return "Hugging Face response: " + obj.getString("message");
+                    JSONObject jsonResponse = new JSONObject(responseBody);
+
+                    if (!jsonResponse.has("choices")) {
+                        logger.error("No choices field in response");
+                        return "Unexpected API response format.";
                     }
 
-                    logger.warn("Unexpected response format: {}", responseBody);
-                    return "Unexpected response format.";
+                    JSONArray choices = jsonResponse.getJSONArray("choices");
+                    if (choices.isEmpty()) {
+                        logger.warn("Empty choices array");
+                        return "The model didn't return a response.";
+                    }
+
+                    JSONObject firstChoice = choices.getJSONObject(0);
+                    JSONObject message = firstChoice.getJSONObject("message");
+                    String answer = message.getString("content").trim();
+
+                    // Cache and return
+                    answerCache.put(cacheKey, new CacheEntry(answer, System.currentTimeMillis() / 1000));
+                    logger.debug("Cached answer for question: {}", question);
+
+                    return answer;
+
                 } catch (Exception e) {
                     logger.error("Request failed on attempt {}: {}", attempt, e.getMessage());
                     if (attempt == 3) {
                         return "Failed after retries: " + e.getMessage();
                     }
-                    Thread.sleep(2000L * attempt); // Exponential backoff
+                    Thread.sleep(2000L * attempt);
                 }
             }
-            logger.error("Failed to get a response after 3 retries");
-            return "Failed to get a response after retries.";
+
+            logger.error("Failed to get response after retries");
+            return "Failed to get response after retries.";
+
         } catch (Exception e) {
             logger.error("Unexpected error: {}", e.getMessage());
             return "Something went wrong: " + e.getMessage();

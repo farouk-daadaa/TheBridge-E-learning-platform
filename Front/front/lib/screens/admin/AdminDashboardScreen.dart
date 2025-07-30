@@ -52,6 +52,7 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
         title: Text('Admin Dashboard'),
         backgroundColor: Color(0xFFDB2777),
         elevation: 0,
+        foregroundColor: Colors.white,
         actions: [
           IconButton(
             icon: Icon(Icons.logout),
@@ -60,6 +61,7 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
           ),
         ],
       ),
+
       body: Row(
         children: [
           if (isWideScreen)
